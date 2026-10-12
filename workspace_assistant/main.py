@@ -73,6 +73,8 @@ def main():
     args = parser.parse_args()
     agent = create_agent()
     runner = InMemoryRunner(agent=agent)
+    # Newer google-adk versions no longer create the session implicitly.
+    runner.auto_create_session = True
 
     if args.interactive:
         interactive_mode(runner)
