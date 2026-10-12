@@ -117,11 +117,25 @@ The trade-off is an extra model step whenever a non-preloaded GitHub tool is nee
 
 ---
 
+## Live Test (Colab, real Google Calendar)
+
+Besides the offline tests, I ran the agent against my real Google Calendar in Google Colab (`gemini-3.8-flash`). A helper printed every tool call and its status:
+
+- **Calendar API, called directly:** `list_upcoming_events` returned my real upcoming event ("Personal appointment", Fri Oct 16, 2:00 PM).
+- **Agent, write path with confirmation:** asked to move the test event "Assignment 2 test", the agent found its `event_id`, asked me to confirm, and only after I answered "Yes" called `reschedule_event`. The result was `success | Moved 'Assignment 2 test' from Mon Oct 12, 2026 3:00 PM to 4:00 PM`. The change appeared in Google Calendar.
+- **What live testing revealed (and fixes):**
+  1. *Colab pre-installs an older `mcp` package.* ADK's `mcp_tool` package then fails to import `McpToolset`, and a partly loaded module stays cached until the Python process restarts. The fix was to upgrade `mcp` and `google-adk`, then force a kernel restart.
+  2. *The MCP server failed to start in Jupyter with `fileno`.* The stdio client passes `sys.stderr` to the subprocess, and Colab's stderr has no file descriptor. `GitHubMcpToolset` now sends the server log to a temp file when `sys.stderr.fileno()` is unavailable. Because of Challenge 4, the calendar kept working while GitHub was down, which confirmed the graceful-degradation design.
+  3. *Model availability:* `503 UNAVAILABLE` ("high demand") and then `429 RESOURCE_EXHAUSTED` (free-tier quota). I added a retry with backoff (20s/40s/60s) to the test helper. The quota ran out after the calendar tests, so the live GitHub queries and the live Gemini prompt-token comparison are left for a re-run once the quota resets. The tool-declaration measurement above was taken against the real GitHub MCP server.
+
+---
+
 ## Ideas for Improvement
 
-1. **Semantic tool search:** replace keyword overlap with embeddings over tool descriptions. Queries like "what changed recently" would then find `list_commits` without synonym lists. I would also "unload" tools that have not been used for several turns.
-2. **Public tour booking:** a real use I have for these tools is a "Schedule a tour" flow on a childcare listing page, replacing a third-party booking link. Each listing has its own allowed tour window ("non-holiday Tue/Wed/Thu 17:00–19:00"), and both the parent and the provider get the invitation. For a public page I would not expose the LLM agent directly, to avoid prompt injection, spam and cost. Instead I would reuse the validation logic as a fixed API: validate the chosen time against the parsed schedule, then send an `.ics` invitation, with the LLM used only offline to parse free-text schedules into JSON.
-3. **Recurring events and time zones per attendee:** support "every Monday" and show slots in each attendee's own time zone. I would also add `delete_event` behind a stricter confirmation step.
+1. **Production resilience:** move retry-with-backoff for 429/503 into the agent itself (e.g. a model-call wrapper or plugin), with a fallback model, so quota spikes do not surface to the user.
+2. **Semantic tool search:** replace keyword overlap with embeddings over tool descriptions. Queries like "what changed recently" would then find `list_commits` without synonym lists. I would also "unload" tools that have not been used for several turns.
+3. **Public tour booking:** a real use I have for these tools is a "Schedule a tour" flow on a childcare listing page, replacing a third-party booking link. Each listing has its own allowed tour window ("non-holiday Tue/Wed/Thu 17:00–19:00"), and both the parent and the provider get the invitation. For a public page I would not expose the LLM agent directly, to avoid prompt injection, spam and cost. Instead I would reuse the validation logic as a fixed API: validate the chosen time against the parsed schedule, then send an `.ics` invitation, with the LLM used only offline to parse free-text schedules into JSON.
+4. **Recurring events and time zones per attendee:** support "every Monday" and show slots in each attendee's own time zone. I would also add `delete_event` behind a stricter confirmation step.
 
 ---
 

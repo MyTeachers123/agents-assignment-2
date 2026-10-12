@@ -1,5 +1,6 @@
-# Credentials (NEVER commit these)
-config/credentials/*.json
+# Credentials (NEVER commit these) - ignore everything in the folder except .gitkeep
+config/credentials/*
+!config/credentials/.gitkeep
 
 # Environment
 .env
