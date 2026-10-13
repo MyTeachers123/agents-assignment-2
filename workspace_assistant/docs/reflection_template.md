@@ -88,7 +88,7 @@ The `message` explains the problem in plain language, and the `hint` says how to
 - **Scheduling safety:** write tools return `conflict` instead of double-booking, and the agent must offer alternatives. All-day, "free" and declined events do not count as conflicts.
 - **GitHub/MCP:** server start failures degrade gracefully (Challenge 4), and `search_github_tools` returns the list of available tool names when nothing matches.
 
-**Testing:** `tests/test_calendar_offline.py` contains 12 unit tests that run against an in-memory fake Calendar client, so validation, conflict detection, slot search and error messages are tested without a Google account. Both course checks pass:
+**Testing:** `tests/test_calendar_offline.py` contains 16 unit tests that run against an in-memory fake Calendar client, so validation, conflict detection, slot search and error messages are tested without a Google account. Both course checks pass:
 
 - `tests.test_tools`: 8/8
 - `tests.test_mcp`: all checks pass
@@ -103,17 +103,27 @@ The `message` explains the problem in plain language, and the `hint` says how to
 - `search_github_tools(query)` ranks the full GitHub catalog by keyword overlap with tool names and descriptions, with simple synonyms (repo→repository, PR→pull, README→file). It activates the top 3 matches for the session.
 - `create_agent_with_tool_search()` builds the agent with the calendar tools, the deferred toolset and `search_github_tools`, plus an instruction that says to search before using any other GitHub tool.
 
-**Comparison:** measured with `python -m scripts.compare_context_tokens`. The script captures the tool declarations sent on the first model call for the query "List my GitHub repositories", using the real `@modelcontextprotocol/server-github` server (26 tools). Token counts are estimated as JSON characters / 4.
+**Comparison (real Gemini token counts):** the same query is run through both agents against the real `@modelcontextprotocol/server-github` server (26 tools). The script records the tools declared on the first model call and the prompt token counts reported by Gemini itself (`usage_metadata.prompt_token_count`). The `~tokens` rows are only a size estimate of the declarations (JSON characters / 4). The two **Prompt tokens** rows are the measured values.
 
-| Mode | Tools Loaded | GitHub tool declarations | All tool declarations |
-|------|--------------|--------------------------|-----------------------|
-| Without defer_loading | 32 (6 calendar + 26 GitHub) | ~6,478 tokens | ~8,558 tokens |
-| With defer_loading | 9 (6 calendar + 2 GitHub + search) | ~601 tokens | ~2,680 tokens |
-| **Savings** | **72% fewer tools** | **~91%** | **~69%** |
+<!-- TOKEN_RESULTS:START -->
+Measured on 2026-10-13 with `python -m scripts.compare_context_tokens`.
 
-The GitHub portion drops by about 91%, close to the ~80% the assignment expects. The total drops less, because the six calendar tools (with long, descriptive docstrings) are always loaded.
+- **Query:** "List my GitHub repositories"
+- **Model:** `gemini-3.8-flash` | **google-adk** 2.11.0 | **mcp** 2.3.0
+- **Prompt tokens** are Gemini's own `usage_metadata.prompt_token_count`. "Whole query" adds up every model call needed to answer the query.
 
-The trade-off is an extra model step whenever a non-preloaded GitHub tool is needed (search, then call). That step costs about 100–150 tokens of results, which is still far below the ~5,900 tokens saved on every single request.
+| Metric | Without defer_loading | With defer_loading | Reduction |
+|---|---:|---:|---:|
+| Tools declared (1st call) | 32 | 9 | 72% |
+| All tool declarations, ~tokens (chars/4) | 8580 | 2702 | 69% |
+| GitHub tool declarations, ~tokens (chars/4) | 6478 | 601 | 91% |
+| **Prompt tokens, 1st call (Gemini)** | 9693 | 3938 | 59% |
+| **Prompt tokens, whole query (Gemini)** | 9693 | 3938 | 59% |
+<!-- TOKEN_RESULTS:END -->
+
+Most of the GitHub tool schemas disappear from every request. The total prompt drops less than the GitHub portion alone, because the system instruction and the six calendar tools (with long, descriptive docstrings) are always sent.
+
+The trade-off is an extra model step whenever a non-preloaded GitHub tool is needed (search, then call). That step adds one more model call (included in the "whole query" row), but it is only paid when a rare tool is needed, while the saving applies to every request.
 
 ---
 
@@ -126,7 +136,17 @@ Besides the offline tests, I ran the agent against my real Google Calendar in Go
 - **What live testing revealed (and fixes):**
   1. *Colab pre-installs an older `mcp` package.* ADK's `mcp_tool` package then fails to import `McpToolset`, and a partly loaded module stays cached until the Python process restarts. The fix was to upgrade `mcp` and `google-adk`, then force a kernel restart.
   2. *The MCP server failed to start in Jupyter with `fileno`.* The stdio client passes `sys.stderr` to the subprocess, and Colab's stderr has no file descriptor. `GitHubMcpToolset` now sends the server log to a temp file when `sys.stderr.fileno()` is unavailable. Because of Challenge 4, the calendar kept working while GitHub was down, which confirmed the graceful-degradation design.
-  3. *Model availability:* `503 UNAVAILABLE` ("high demand") and then `429 RESOURCE_EXHAUSTED` (free-tier quota). I added a retry with backoff (20s/40s/60s) to the test helper. The quota ran out after the calendar tests, so the live GitHub queries and the live Gemini prompt-token comparison are left for a re-run once the quota resets. The tool-declaration measurement above was taken against the real GitHub MCP server.
+  3. *Model availability:* `503 UNAVAILABLE` ("high demand") and then `429 RESOURCE_EXHAUSTED` (free-tier quota). I added a retry with backoff (20s/40s/60s) to the test helper. The quota ran out after the calendar tests, so the Gemini prompt-token comparison was re-run later on my own machine (see the Bonus section). The comparison script now retries on 503/429 by itself and, if one model stays busy, switches to another Flash model for both runs, so both numbers always come from the same model.
+
+---
+
+## Changes After TA Feedback
+
+1. **Privacy:** removed the OAuth client ID, a sign-in authorization code and a real calendar event title from the repository, including from git history (rewritten with `git filter-repo --replace-text` and force-pushed). `.env`, `credentials.json` and `token.json` stay git-ignored.
+2. **`find_available_slots` "more" flag:** the tool now collects one slot beyond `max_slots` and returns `more_available: true` when there are later options, plus a short note. The instruction tells the agent to say these are the earliest options and offer to look further. Tested in `test_find_slots_reports_more_available`.
+3. **Real token counts:** the estimate-only table was replaced by Gemini's measured prompt tokens (Bonus section), with the query, model, and ADK/MCP versions.
+4. **No raw error text:** unexpected exceptions are logged to the terminal (`logger.exception`), and the user only sees "Could not … because of an unexpected problem. Please try again." Tested in `test_unexpected_error_is_not_shown_raw`.
+5. **Time zone:** no longer hard-coded to Los Angeles. The order is `CALENDAR_TIMEZONE` from `.env`, then the time zone of the user's Google Calendar (only if already signed in, so it never opens a login window), then the computer's local time zone. Tested in `test_timezone_from_env` and `test_timezone_from_google_calendar`.
 
 ---
 
@@ -143,6 +163,6 @@ Besides the offline tests, I ran the agent against my real Google Calendar in Go
 
 The biggest lesson is that **tool design is prompt design**. The model only sees names, docstrings and type hints, so a sentence like "Use this when the user asks 'Am I free at 3pm?'" or "Do NOT use this to create the event" changed tool selection more than any wording in the system instruction. Structured return values matter just as much. Because every tool reports `success`, `conflict` or `error` with a hint, the agent can explain failures and recover instead of hallucinating success. Safety rules such as "never double-book" belong in the tool's code, with the prompt only as a second layer.
 
-Second, **context is a budget**. Connecting one MCP server added 26 tool schemas (about 6,500 tokens) to every request, even when the user only asked about their calendar. The tool-search pattern cut the GitHub portion by about 91% at the cost of one extra step when a rare tool is needed. That trade-off, paying a little latency for a much smaller context, will matter more as agents connect to more servers.
+Second, **context is a budget**. Connecting one MCP server added 26 tool schemas to every request, even when the user only asked about their calendar. The tool-search pattern removed most of them from the prompt (measured with Gemini's own token counts in the Bonus section) at the cost of one extra step when a rare tool is needed. That trade-off, paying a little latency for a much smaller context, will matter more as agents connect to more servers.
 
 Finally, **agent frameworks move fast**, so I need to read the source, not just the examples. In one week the starter model was retired, the runner stopped creating sessions automatically, and the suggested `defer_loading` argument did not exist. Each fix came from reading the actual ADK code (for example, the per-invocation tool cache) and testing against a mock MCP server, rather than trusting the scaffold comments. Keeping the model name in configuration and building tools that fail gracefully made those changes easy to absorb.

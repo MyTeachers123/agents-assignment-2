@@ -8,20 +8,24 @@ one. Every tool:
 - validates its inputs before touching the API,
 - never raises: it returns {"status": "success", ...} or
   {"status": "error", "message": <user-friendly text>, "hint": <how to fix>},
-- works in one configurable time zone (CALENDAR_TIMEZONE, default
-  America/Los_Angeles), so "2pm" always means 2pm local time.
+- works in the user's own time zone: CALENDAR_TIMEZONE if set, otherwise the
+  time zone of the user's Google Calendar, otherwise the computer's local
+  time zone - so "2pm" always means 2pm for this user.
 
 Write operations (create_event, reschedule_event) check for conflicts first and
 refuse to double-book unless the caller explicitly passes allow_conflicts=True.
 """
 
+import logging
 import os
 import re
 from datetime import date, datetime, time, timedelta
 from typing import List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tools.auth import get_calendar_service
+from tools.auth import TOKEN_FILE, get_calendar_service
+
+logger = logging.getLogger(__name__)
 
 try:  # Only for nicer error messages; tools still work if these are missing.
     from googleapiclient.errors import HttpError
@@ -44,24 +48,50 @@ MAX_SEARCH_DAYS = 31            # find_available_slots search window limit
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def _get_timezone():
-    """IANA time zone from CALENDAR_TIMEZONE.
+_tz_cache: Optional[tuple] = None
+
+
+def _resolve_timezone() -> tuple:
+    """Find the user's time zone, in this order:
+
+    1. CALENDAR_TIMEZONE environment variable (an IANA name),
+    2. the time zone set on the user's Google Calendar,
+    3. the computer's local time zone.
 
     Windows has no system time-zone database, so the `tzdata` package (in
-    requirements.txt) provides it. If it is missing, fall back to the
-    computer's local time zone instead of crashing.
+    requirements.txt) provides the IANA names.
     """
-    name = os.getenv("CALENDAR_TIMEZONE", "America/Los_Angeles")
-    for candidate in (name, "America/Los_Angeles"):
+    candidates = []
+    if os.getenv("CALENDAR_TIMEZONE"):
+        candidates.append(os.environ["CALENDAR_TIMEZONE"].strip())
+    elif TOKEN_FILE.exists():  # only if already signed in - never open a login window here
         try:
-            return ZoneInfo(candidate), candidate
+            cal = get_calendar_service().calendars().get(calendarId=CALENDAR_ID).execute()
+            if cal.get("timeZone"):
+                candidates.append(cal["timeZone"])
+        except Exception as e:  # not signed in yet, offline, ...
+            logger.info("Could not read the calendar's time zone: %s", e)
+    for name in candidates:
+        try:
+            return ZoneInfo(name), name
         except (ZoneInfoNotFoundError, ValueError):
-            continue
+            logger.warning("Unknown time zone %r; falling back to local time", name)
     local = datetime.now().astimezone().tzinfo
-    return local, "UTC"  # name only used for API formatting; offsets stay correct
+    key = getattr(local, "key", None)  # IANA name if the system provides one
+    return local, key or "UTC"  # API bodies always carry explicit UTC offsets too
 
 
-TZ, TZ_NAME = _get_timezone()
+def _tz():
+    """The user's time zone (resolved once, on first use)."""
+    global _tz_cache
+    if _tz_cache is None:
+        _tz_cache = _resolve_timezone()
+    return _tz_cache[0]
+
+
+def _tz_name() -> str:
+    _tz()
+    return _tz_cache[1]
 
 
 # =============================================================================
@@ -119,11 +149,16 @@ def _api_error(exc: Exception, action: str) -> dict:
         if code and int(code) >= 500:
             return _error(f"Could not {action}: Google Calendar is temporarily unavailable.",
                           "Try again in a moment.")
-    return _error(f"Could not {action}: {type(exc).__name__}: {exc}")
+    # Unexpected error: log the technical details, show the user plain language.
+    logger.exception("Unexpected error while trying to %s", action)
+    return _error(
+        f"Could not {action} because of an unexpected problem.",
+        "Please try again. If it keeps happening, check the terminal log for details.",
+    )
 
 
 def _parse_datetime(value: str, field: str = "time") -> datetime:
-    """Parse 'YYYY-MM-DD HH:MM' / ISO 8601 into an aware datetime in TZ."""
+    """Parse 'YYYY-MM-DD HH:MM' / ISO 8601 into an aware datetime in the user's time zone."""
     if not value or not isinstance(value, str):
         raise _InputError(f"Missing {field}.", "Use the format YYYY-MM-DD HH:MM, e.g. 2026-10-13 14:00.")
     text = value.strip().replace("Z", "+00:00")
@@ -136,7 +171,7 @@ def _parse_datetime(value: str, field: str = "time") -> datetime:
         ) from None
     if len(text) == 10:  # date only -> start of day
         dt = datetime.combine(dt.date(), time(0, 0))
-    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
+    return dt.replace(tzinfo=_tz()) if dt.tzinfo is None else dt.astimezone(_tz())
 
 
 def _parse_date(value: str, field: str = "date") -> date:
@@ -187,7 +222,7 @@ def _human(dt: datetime) -> str:
 def _event_time(raw: dict) -> str:
     """Event start/end -> readable local time (all-day events show the date)."""
     if "dateTime" in raw:
-        return _human(datetime.fromisoformat(raw["dateTime"].replace("Z", "+00:00")).astimezone(TZ))
+        return _human(datetime.fromisoformat(raw["dateTime"].replace("Z", "+00:00")).astimezone(_tz()))
     return f"{raw.get('date', '?')} (all day)"
 
 
@@ -230,7 +265,7 @@ def _busy_intervals(service, start: datetime, end: datetime,
                     attendees: List[str]) -> tuple[list[tuple[datetime, datetime]], list[str]]:
     """Merged busy intervals for the user + attendees, and calendars we couldn't read."""
     body = {
-        "timeMin": _iso(start), "timeMax": _iso(end), "timeZone": TZ_NAME,
+        "timeMin": _iso(start), "timeMax": _iso(end), "timeZone": _tz_name(),
         "items": [{"id": CALENDAR_ID}] + [{"id": e} for e in attendees],
     }
     calendars = service.freebusy().query(body=body).execute().get("calendars", {})
@@ -271,13 +306,13 @@ def get_current_datetime() -> dict:
         dict with 'status', 'now' (YYYY-MM-DD HH:MM), 'date', 'weekday' and 'timezone'.
     """
     try:
-        now = datetime.now(TZ)
+        now = datetime.now(_tz())
         return {
             "status": "success",
             "now": now.strftime("%Y-%m-%d %H:%M"),
             "date": now.strftime("%Y-%m-%d"),
             "weekday": now.strftime("%A"),
-            "timezone": TZ_NAME,
+            "timezone": _tz_name(),
         }
     except Exception as e:  # extremely unlikely, but never crash the agent
         return _error(f"Could not read the current time: {e}")
@@ -309,8 +344,8 @@ def list_upcoming_events(
     try:
         if not 1 <= int(max_results) <= MAX_RESULTS_CAP:
             raise _InputError(f"max_results must be between 1 and {MAX_RESULTS_CAP}.")
-        now = datetime.now(TZ)
-        time_min = (datetime.combine(_parse_date(start_date, "start date"), time(0, 0), TZ)
+        now = datetime.now(_tz())
+        time_min = (datetime.combine(_parse_date(start_date, "start date"), time(0, 0), _tz())
                     if start_date else now)
         params = {
             "calendarId": CALENDAR_ID, "timeMin": _iso(time_min),
@@ -318,7 +353,7 @@ def list_upcoming_events(
         }
         if end_date:
             time_max = datetime.combine(_parse_date(end_date, "end date") + timedelta(days=1),
-                                        time(0, 0), TZ)
+                                        time(0, 0), _tz())
             if time_max <= time_min:
                 raise _InputError("The end date must be on or after the start date.")
             params["timeMax"] = _iso(time_max)
@@ -368,8 +403,9 @@ def find_available_slots(
 
     Returns:
         dict with 'status', 'slots' (each with 'start' and 'end' as YYYY-MM-DD HH:MM
-        plus a readable 'label'), and 'unchecked_attendees' for calendars that
-        could not be read; or 'status': 'error' and 'message'.
+        plus a readable 'label'), 'more_available' (True if there are more free
+        slots after the last one returned), and 'unchecked_attendees' for
+        calendars that could not be read; or 'status': 'error' and 'message'.
     """
     try:
         first = _parse_date(start_date, "start date")
@@ -388,9 +424,9 @@ def find_available_slots(
             raise _InputError("work_day_end must be later than work_day_start.")
         attendees = _validate_emails(attendee_emails)
 
-        window_start = datetime.combine(first, day_start, TZ)
-        window_end = datetime.combine(last, day_end, TZ)
-        now = datetime.now(TZ)
+        window_start = datetime.combine(first, day_start, _tz())
+        window_end = datetime.combine(last, day_end, _tz())
+        now = datetime.now(_tz())
         if window_end <= now:
             raise _InputError("That date range is already in the past.",
                               "Call get_current_datetime to check today's date.")
@@ -400,15 +436,17 @@ def find_available_slots(
 
         length = timedelta(minutes=int(duration_minutes))
         step = timedelta(minutes=SLOT_STEP_MINUTES)
+        limit = int(max_slots)
         slots: list[dict] = []
         day = first
-        while day <= last and len(slots) < int(max_slots):
+        # Collect one more than requested so we can tell the model more exist.
+        while day <= last and len(slots) <= limit:
             if include_weekends or day.weekday() < 5:
-                cursor = datetime.combine(day, day_start, TZ)
+                cursor = datetime.combine(day, day_start, _tz())
                 if cursor < now:
                     cursor = _round_up(now, SLOT_STEP_MINUTES)
-                closing = datetime.combine(day, day_end, TZ)
-                while cursor + length <= closing and len(slots) < int(max_slots):
+                closing = datetime.combine(day, day_end, _tz())
+                while cursor + length <= closing and len(slots) <= limit:
                     end = cursor + length
                     clash = next((b for b in busy if b[0] < end and cursor < b[1]), None)
                     if clash:
@@ -422,12 +460,19 @@ def find_available_slots(
                     cursor += length if length >= step else step
             day += timedelta(days=1)
 
+        more_available = len(slots) > limit
+        slots = slots[:limit]
         result = {
             "status": "success",
-            "timezone": TZ_NAME,
+            "timezone": _tz_name(),
             "slots": slots,
+            "more_available": more_available,
             "unchecked_attendees": unreadable,
         }
+        if more_available:
+            result["note_more"] = (f"Showing the first {limit} free slots; more are available later "
+                                   f"in the range. Ask the user if they want later options, or call "
+                                   f"again with a later start_date.")
         if not slots:
             result["message"] = "No free slots found. Try a wider date range, a shorter meeting, or include weekends."
         if unreadable:
@@ -469,7 +514,7 @@ def check_conflicts(
 
         busy_attendees, unchecked = [], []
         if attendees:
-            body = {"timeMin": _iso(start), "timeMax": _iso(end), "timeZone": TZ_NAME,
+            body = {"timeMin": _iso(start), "timeMax": _iso(end), "timeZone": _tz_name(),
                     "items": [{"id": e} for e in attendees]}
             cals = service.freebusy().query(body=body).execute().get("calendars", {})
             for email in attendees:
@@ -529,7 +574,7 @@ def create_event(
             raise _InputError("The event needs a title.", "Ask the user what to call the event.")
         start = _parse_datetime(start_time, "start time")
         end = _resolve_end(start, end_time, duration_minutes)
-        if start < datetime.now(TZ) - timedelta(minutes=5):
+        if start < datetime.now(_tz()) - timedelta(minutes=5):
             raise _InputError("That start time is in the past.",
                               "Call get_current_datetime and choose a future time.")
         attendees = _validate_emails(attendee_emails)
@@ -547,8 +592,8 @@ def create_event(
 
         body = {
             "summary": summary.strip(),
-            "start": {"dateTime": _iso(start), "timeZone": TZ_NAME},
-            "end": {"dateTime": _iso(end), "timeZone": TZ_NAME},
+            "start": {"dateTime": _iso(start), "timeZone": _tz_name()},
+            "end": {"dateTime": _iso(end), "timeZone": _tz_name()},
         }
         if description:
             body["description"] = description
@@ -598,7 +643,7 @@ def reschedule_event(
         if not event_id or not event_id.strip():
             raise _InputError("Missing event_id.", "Call list_upcoming_events to find the event first.")
         new_start = _parse_datetime(new_start_time, "new start time")
-        if new_start < datetime.now(TZ) - timedelta(minutes=5):
+        if new_start < datetime.now(_tz()) - timedelta(minutes=5):
             raise _InputError("The new start time is in the past.",
                               "Call get_current_datetime and choose a future time.")
 
@@ -628,8 +673,8 @@ def reschedule_event(
         updated = service.events().patch(
             calendarId=CALENDAR_ID, eventId=event["id"],
             body={
-                "start": {"dateTime": _iso(new_start), "timeZone": TZ_NAME},
-                "end": {"dateTime": _iso(new_end), "timeZone": TZ_NAME},
+                "start": {"dateTime": _iso(new_start), "timeZone": _tz_name()},
+                "end": {"dateTime": _iso(new_end), "timeZone": _tz_name()},
             },
             sendUpdates="all",
         ).execute()

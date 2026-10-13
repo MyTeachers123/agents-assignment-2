@@ -8,9 +8,13 @@ search, and friendly error messages.
 Usage (from workspace_assistant/):  python -m pytest tests/test_calendar_offline.py -q
 """
 
+import os
 from datetime import datetime, timedelta
 
 import pytest
+
+# Offline tests: fix the time zone so nothing ever contacts Google or opens a login window.
+os.environ.setdefault("CALENDAR_TIMEZONE", "America/Los_Angeles")
 
 import tools.calendar_tools as ct
 
@@ -89,7 +93,7 @@ class FakeCalendar:
 
 def _day(offset_days: int):
     """A weekday date `offset_days` or more in the future (YYYY-MM-DD)."""
-    d = datetime.now(ct.TZ).date() + timedelta(days=offset_days)
+    d = datetime.now(ct._tz()).date() + timedelta(days=offset_days)
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d.isoformat()
@@ -189,3 +193,41 @@ def test_missing_credentials_message(monkeypatch):
     monkeypatch.setattr(ct, "get_calendar_service", boom)
     r = ct.list_upcoming_events()
     assert r["status"] == "error" and "google_auth_setup" in r["hint"]
+
+
+def test_find_slots_reports_more_available(fake):
+    r = ct.find_available_slots(fake.day, duration_minutes=30, max_slots=3)
+    assert len(r["slots"]) == 3 and r["more_available"] is True and "note_more" in r
+    r = ct.find_available_slots(fake.day, duration_minutes=60, max_slots=20)
+    assert r["more_available"] is False
+
+
+def test_unexpected_error_is_not_shown_raw(monkeypatch):
+    def boom():
+        raise RuntimeError("socket.gaierror internal detail")
+    monkeypatch.setattr(ct, "get_calendar_service", boom)
+    r = ct.list_upcoming_events()
+    assert r["status"] == "error" and "internal detail" not in r["message"]
+    assert "unexpected problem" in r["message"]
+
+
+def test_timezone_from_env(monkeypatch):
+    monkeypatch.setenv("CALENDAR_TIMEZONE", "Asia/Taipei")
+    monkeypatch.setattr(ct, "_tz_cache", None)
+    assert ct._tz_name() == "Asia/Taipei"
+    monkeypatch.setattr(ct, "_tz_cache", None)
+
+
+def test_timezone_from_google_calendar(monkeypatch, tmp_path):
+    token = tmp_path / "token.json"
+    token.write_text("{}")
+    monkeypatch.setattr(ct, "TOKEN_FILE", token)
+    class Svc:
+        def calendars(self): return self
+        def get(self, calendarId): return self
+        def execute(self): return {"timeZone": "Europe/London"}
+    monkeypatch.delenv("CALENDAR_TIMEZONE", raising=False)
+    monkeypatch.setattr(ct, "get_calendar_service", lambda: Svc())
+    monkeypatch.setattr(ct, "_tz_cache", None)
+    assert ct._tz_name() == "Europe/London"
+    monkeypatch.setattr(ct, "_tz_cache", None)

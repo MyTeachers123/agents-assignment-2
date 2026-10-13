@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +70,20 @@ def _github_server_params(token: str) -> StdioServerParameters:
     )
 
 
+def _safe_errlog():
+    """Where the MCP server's stderr goes.
+
+    Jupyter/Colab replace sys.stderr with an object that has no real file
+    descriptor, and starting the server subprocess then fails with 'fileno'.
+    In that case write the server's log to a temp file instead.
+    """
+    try:
+        sys.stderr.fileno()
+        return sys.stderr
+    except (AttributeError, OSError, ValueError):
+        return open(os.path.join(tempfile.gettempdir(), "github_mcp_server.log"), "a")
+
+
 class GitHubMcpToolset(McpToolset):
     """McpToolset with graceful failure and optional defer_loading."""
 
@@ -80,6 +96,7 @@ class GitHubMcpToolset(McpToolset):
     ):
         if defer_loading:
             kwargs["tool_filter"] = self._deferred_tool_filter
+        kwargs.setdefault("errlog", _safe_errlog())
         super().__init__(**kwargs)
         self.defer_loading = defer_loading
         self.always_loaded = set(always_loaded or ALWAYS_LOADED_GITHUB_TOOLS)
